@@ -12,7 +12,7 @@ Custom Meshtastic firmware module for peer-to-peer RFID tag reading and transmis
 | MT3608 + MOSFET switch | Power control for RDM6300 | GPIO D6 (HIGH=on, LOW=off) |
 | LiPo Battery | 3.7V power source | RAW pin |
 
-See `../rfid/main.ato` for the complete circuit design.
+See the [rfid-open](https://github.com/ninformations/rfid-open) repo for the complete Atopile circuit design.
 
 ## How It Works
 
