@@ -28,22 +28,22 @@ cd "${FIRMWARE_DIR}"
 case "${1:-build}" in
     build)
         echo "Building ${TARGET}..."
-        pio run -e "${TARGET}"
+        uv run pio run -e "${TARGET}"
         echo ""
         echo "Build complete. Firmware at:"
         echo "  .pio/build/${TARGET}/firmware.uf2"
         ;;
     upload)
         echo "Building and uploading ${TARGET}..."
-        pio run -e "${TARGET}" -t upload
+        uv run pio run -e "${TARGET}" -t upload
         ;;
     clean)
         echo "Cleaning ${TARGET} build..."
-        pio run -e "${TARGET}" -t clean
+        uv run pio run -e "${TARGET}" -t clean
         ;;
     monitor)
         echo "Opening serial monitor (115200 baud)..."
-        pio device monitor -b 115200
+        uv run pio device monitor -b 115200
         ;;
     *)
         echo "Usage: $0 [build|upload|clean|monitor]"

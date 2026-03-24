@@ -1,6 +1,10 @@
 # Meshtastic firmware (cloned by setup.sh)
 firmware/
 
+# Python / uv
+.venv/
+__pycache__/
+
 # PlatformIO
 .pio/
 .pioenvs/
