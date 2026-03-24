@@ -2,8 +2,8 @@
 #
 # RFID-Meshtastic Setup Script
 #
-# Clones the Meshtastic firmware, creates symlinks for the custom variant
-# and RFID module, and patches Modules.cpp to register the module.
+# Clones the Meshtastic firmware, copies the custom variant and RFID module
+# files into the firmware tree, and patches Modules.cpp to register the module.
 #
 # Usage: ./setup.sh [--firmware-tag <tag>]
 #
@@ -49,39 +49,27 @@ fi
 echo "  Firmware ready at: ${FIRMWARE_DIR}"
 echo ""
 
-# ── Step 2: Create variant symlink ──
-echo "[2/4] Creating variant symlink..."
+# ── Step 2: Copy variant files ──
+echo "[2/4] Copying variant files..."
 cd "${FIRMWARE_DIR}"
 
 # Create parent directory if needed
-mkdir -p "$(dirname "${VARIANT_DST}")"
+mkdir -p "${VARIANT_DST}"
 
-# Remove existing symlink or directory
-if [ -L "${VARIANT_DST}" ] || [ -d "${VARIANT_DST}" ]; then
-    rm -rf "${VARIANT_DST}"
-fi
-
-# Create symlink: firmware/variants/nrf52840/diy/nrf52_promicro_rfid -> ../../variant/
-ln -sf "${SCRIPT_DIR}/variant" "${VARIANT_DST}"
-echo "  Linked: ${VARIANT_DST} -> ${SCRIPT_DIR}/variant"
+# Copy variant files (not symlink — PlatformIO build_src_filter needs real files)
+cp -f "${SCRIPT_DIR}/variant/variant.h" "${VARIANT_DST}/variant.h"
+cp -f "${SCRIPT_DIR}/variant/variant.cpp" "${VARIANT_DST}/variant.cpp"
+cp -f "${SCRIPT_DIR}/variant/platformio.ini" "${VARIANT_DST}/platformio.ini"
+echo "  Copied: variant.h, variant.cpp, platformio.ini -> ${VARIANT_DST}/"
 echo ""
 
-# ── Step 3: Create module symlinks ──
-echo "[3/4] Creating module symlinks..."
+# ── Step 3: Copy module files ──
+echo "[3/4] Copying module files..."
 
-# Symlink RFIDModule.h
-if [ -L "${MODULE_DST}/RFIDModule.h" ]; then
-    rm "${MODULE_DST}/RFIDModule.h"
-fi
-ln -sf "${SCRIPT_DIR}/module/RFIDModule.h" "${MODULE_DST}/RFIDModule.h"
-echo "  Linked: ${MODULE_DST}/RFIDModule.h"
-
-# Symlink RFIDModule.cpp
-if [ -L "${MODULE_DST}/RFIDModule.cpp" ]; then
-    rm "${MODULE_DST}/RFIDModule.cpp"
-fi
-ln -sf "${SCRIPT_DIR}/module/RFIDModule.cpp" "${MODULE_DST}/RFIDModule.cpp"
-echo "  Linked: ${MODULE_DST}/RFIDModule.cpp"
+# Copy RFIDModule files (symlinks work fine for src/modules/)
+cp -f "${SCRIPT_DIR}/module/RFIDModule.h" "${MODULE_DST}/RFIDModule.h"
+cp -f "${SCRIPT_DIR}/module/RFIDModule.cpp" "${MODULE_DST}/RFIDModule.cpp"
+echo "  Copied: RFIDModule.h, RFIDModule.cpp -> ${MODULE_DST}/"
 echo ""
 
 # ── Step 4: Patch Modules.cpp to register RFIDModule ──
@@ -91,33 +79,31 @@ echo "[4/4] Patching Modules.cpp for RFID module registration..."
 if grep -q "RFIDModule" "${MODULES_CPP}"; then
     echo "  Already patched, skipping."
 else
-    # Add the include at the top of the file (after the last #include)
-    # Find the last #include line number and add our include after it
-    LAST_INCLUDE_LINE=$(grep -n "^#include" "${MODULES_CPP}" | tail -1 | cut -d: -f1)
+    # Add the include right before the setupModules() function definition
+    # This avoids inserting inside any #if guards around other includes
+    SETUP_LINE=$(grep -n "^void setupModules" "${MODULES_CPP}" | head -1 | cut -d: -f1)
 
-    if [ -z "${LAST_INCLUDE_LINE}" ]; then
-        echo "  ERROR: Could not find #include lines in Modules.cpp"
+    if [ -z "${SETUP_LINE}" ]; then
+        echo "  ERROR: Could not find setupModules() in Modules.cpp"
         exit 1
     fi
 
-    # Insert our conditional include after the last #include
-    sed -i.bak "${LAST_INCLUDE_LINE}a\\
-\\
+    # Insert our conditional include before setupModules()
+    sed -i.bak "${SETUP_LINE}i\\
 #if defined(NRF52_PROMICRO_RFID)\\
 #include \"RFIDModule.h\"\\
-#endif" "${MODULES_CPP}"
+#endif\\
+" "${MODULES_CPP}"
 
     # Add module instantiation in setupModules() function
-    # Find the line with "new RangeTestModule" or similar module instantiation
-    # and add our module before it
-    if grep -q "new RangeTestModule" "${MODULES_CPP}"; then
-        sed -i.bak "/new RangeTestModule/i\\
+    # Insert before the routing module (which must be last) or before closing brace
+    if grep -q "routingModule = new RoutingModule" "${MODULES_CPP}"; then
+        sed -i.bak "/routingModule = new RoutingModule/i\\
 #if defined(NRF52_PROMICRO_RFID)\\
     new RFIDModule();\\
 #endif" "${MODULES_CPP}"
     else
-        # Fallback: find setupModules function and add near the end
-        # Look for the closing brace of setupModules
+        # Fallback: insert before the closing brace of setupModules
         SETUP_END=$(grep -n "^}" "${MODULES_CPP}" | tail -1 | cut -d: -f1)
         sed -i.bak "${SETUP_END}i\\
 \\

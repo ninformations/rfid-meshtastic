@@ -29,6 +29,8 @@
 #ifndef _VARIANT_NRF52_PROMICRO_RFID_
 #define _VARIANT_NRF52_PROMICRO_RFID_
 
+#include "WVariant.h"
+
 #define VARIANT_MCK (64000000ul)
 
 /* Use low-frequency RC oscillator (no 32kHz crystal on SuperMini clone) */
@@ -52,6 +54,7 @@
  * LED
  * ────────────────────────────────────────────── */
 #define PIN_LED1 (0 + 15) // P0.15 (onboard blue LED)
+#undef LED_BUILTIN
 #define LED_BUILTIN PIN_LED1
 #define LED_BLUE PIN_LED1
 #define LED_STATE_ON 1
@@ -87,6 +90,11 @@ static const uint8_t SCK = PIN_SPI_SCK;
  * RDM6300: 9600 baud, sends 14-byte packets
  * Level shifted: 5V TX → voltage divider → 3.3V RX
  * ────────────────────────────────────────────── */
+/* Serial1 (required by Arduino framework, used for USB serial console) */
+#define PIN_SERIAL1_RX (0 + 8) // Shared with Serial2 RX
+#define PIN_SERIAL1_TX (0 + 6) // Shared with Serial2 TX
+
+/* Serial2 for RDM6300 RFID reader */
 #define PIN_SERIAL2_RX (0 + 8) // P0.08 (gpio 8) at D0/RX position - data FROM RDM6300
 #define PIN_SERIAL2_TX (0 + 6) // P0.06 (gpio 6) at D1/TX position - data TO RDM6300
 
@@ -136,6 +144,7 @@ static const uint8_t SCK = PIN_SPI_SCK;
  * D7/D8 positions are used for LoRa DIO1/BUSY
  * Define on unused pins to avoid build errors
  * ────────────────────────────────────────────── */
+#define WIRE_INTERFACES_COUNT 1
 #define PIN_WIRE_SDA (0 + 17) // P0.17 (D2 position) - not physically connected to I2C
 #define PIN_WIRE_SCL (0 + 20) // P0.20 (D3 position) - not physically connected to I2C
 
