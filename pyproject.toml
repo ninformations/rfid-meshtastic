@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "Custom Meshtastic firmware for P2P RFID scanning"
 requires-python = ">=3.12"
 dependencies = [
+    "meshtastic>=2.7.8",
     "platformio>=6.1.19",
 ]

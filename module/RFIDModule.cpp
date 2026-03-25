@@ -209,8 +209,13 @@ void RFIDModule::checkSerialInput()
                 if (strcasecmp(serialCmdBuf, RFID_CMD_SCAN) == 0) {
                     LOG_INFO("RFID: Local SCAN command - requesting peer to scan");
                     sendScanRequest();
+                } else if (strcasecmp(serialCmdBuf, RFID_CMD_LOCAL) == 0) {
+                    LOG_INFO("RFID: Local test - powering on RFID reader...");
+                    powerOnRFID();
+                    setState(RFID_POWERING_ON);
+                    setIntervalFromNow(RFID_POWER_ON_DELAY_MS);
                 } else {
-                    LOG_WARN("RFID: Unknown command: '%s' (use SCAN)", serialCmdBuf);
+                    LOG_WARN("RFID: Unknown command: '%s' (use SCAN or LOCALSCAN)", serialCmdBuf);
                 }
                 serialCmdLen = 0;
             }

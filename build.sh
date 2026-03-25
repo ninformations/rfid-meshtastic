@@ -43,7 +43,8 @@ case "${1:-build}" in
         ;;
     monitor)
         echo "Opening serial monitor (115200 baud)..."
-        uv run pio device monitor -b 115200
+        # Run from /tmp to avoid PlatformIO resolving all project platforms
+        uv run pio device monitor -b 115200 -d /tmp
         ;;
     *)
         echo "Usage: $0 [build|upload|clean|monitor]"
