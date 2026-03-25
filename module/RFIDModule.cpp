@@ -214,8 +214,16 @@ void RFIDModule::checkSerialInput()
                     powerOnRFID();
                     setState(RFID_POWERING_ON);
                     setIntervalFromNow(RFID_POWER_ON_DELAY_MS);
+                } else if (strcasecmp(serialCmdBuf, RFID_CMD_PWRON) == 0) {
+                    LOG_INFO("RFID: DEBUG - Forcing power ON (GPIO %d HIGH)", PIN_RFID_POWER);
+                    pinMode(PIN_RFID_POWER, OUTPUT);
+                    digitalWrite(PIN_RFID_POWER, HIGH);
+                } else if (strcasecmp(serialCmdBuf, RFID_CMD_PWROFF) == 0) {
+                    LOG_INFO("RFID: DEBUG - Forcing power OFF (GPIO %d LOW)", PIN_RFID_POWER);
+                    pinMode(PIN_RFID_POWER, OUTPUT);
+                    digitalWrite(PIN_RFID_POWER, LOW);
                 } else {
-                    LOG_WARN("RFID: Unknown command: '%s' (use SCAN or LOCALSCAN)", serialCmdBuf);
+                    LOG_WARN("RFID: Unknown command (use SCAN, LOCALSCAN, POWERON, POWEROFF)");
                 }
                 serialCmdLen = 0;
             }
@@ -430,6 +438,20 @@ ProcessMessage RFIDModule::handleReceived(const meshtastic_MeshPacket &mp)
         setState(RFID_POWERING_ON);
         /* Wake the OSThread immediately to process the power-on */
         setIntervalFromNow(RFID_POWER_ON_DELAY_MS);
+        return ProcessMessage::CONTINUE;
+    }
+
+    /* ── Handle POWERON/POWEROFF debug commands from peer ── */
+    if (strcmp(msg, RFID_CMD_PWRON) == 0) {
+        LOG_INFO("RFID: Remote POWERON from %08X - forcing GPIO HIGH", mp.from);
+        pinMode(PIN_RFID_POWER, OUTPUT);
+        digitalWrite(PIN_RFID_POWER, HIGH);
+        return ProcessMessage::CONTINUE;
+    }
+    if (strcmp(msg, RFID_CMD_PWROFF) == 0) {
+        LOG_INFO("RFID: Remote POWEROFF from %08X - forcing GPIO LOW", mp.from);
+        pinMode(PIN_RFID_POWER, OUTPUT);
+        digitalWrite(PIN_RFID_POWER, LOW);
         return ProcessMessage::CONTINUE;
     }
 

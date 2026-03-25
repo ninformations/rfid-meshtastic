@@ -8,6 +8,8 @@ on PRIVATE_APP port (256).
 Usage:
     uv run python rfid_client.py                    # Listen only
     uv run python rfid_client.py scan               # Send SCAN + listen
+    uv run python rfid_client.py poweron             # Force RFID reader ON
+    uv run python rfid_client.py poweroff            # Force RFID reader OFF
     uv run python rfid_client.py scan --dest !d9a0f6a2  # Send to specific node
     uv run python rfid_client.py --port /dev/tty.usbmodem1234  # Specify serial port
 """
@@ -50,8 +52,9 @@ def on_connection(interface, topic=pub.AUTO_TOPIC):
 
 def main():
     parser = argparse.ArgumentParser(description="RFID Meshtastic Client")
-    parser.add_argument("command", nargs="?", default="listen", choices=["scan", "listen"],
-                        help="'scan' to send SCAN command, 'listen' to just listen (default)")
+    parser.add_argument("command", nargs="?", default="listen",
+                        choices=["scan", "listen", "poweron", "poweroff"],
+                        help="'scan' to send SCAN, 'poweron'/'poweroff' to toggle RFID power, 'listen' to just listen (default)")
     parser.add_argument("--dest", default=SENDER_NODE_ID,
                         help=f"Destination node ID (default: {SENDER_NODE_ID})")
     parser.add_argument("--port", default=None,
@@ -68,15 +71,20 @@ def main():
         print(f"Failed to connect: {e}")
         sys.exit(1)
 
-    if args.command == "scan":
-        print(f"Sending SCAN to {args.dest}...")
+    if args.command in ("scan", "poweron", "poweroff"):
+        cmd = {
+            "scan": "SCAN",
+            "poweron": "POWERON",
+            "poweroff": "POWEROFF",
+        }[args.command]
+        print(f"Sending {cmd} to {args.dest}...")
         iface.sendData(
-            b"SCAN",
+            cmd.encode(),
             portNum=PRIVATE_APP_PORT,
             destinationId=args.dest,
             wantAck=True,
         )
-        print("SCAN sent. Waiting for response...")
+        print(f"{cmd} sent. Waiting for response...")
 
     print("Listening for RFID messages (Ctrl+C to quit)...")
     try:

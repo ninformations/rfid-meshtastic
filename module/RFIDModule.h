@@ -57,6 +57,8 @@
 /* Mesh command strings */
 #define RFID_CMD_SCAN "SCAN"         /* Request peer to scan */
 #define RFID_CMD_LOCAL "LOCALSCAN"   /* Test local RFID reader (serial only) */
+#define RFID_CMD_PWRON "POWERON"    /* Force RFID power ON (debug) */
+#define RFID_CMD_PWROFF "POWEROFF"  /* Force RFID power OFF (debug) */
 #define RFID_RESP_PREFIX "RFID:"     /* Tag data response prefix */
 #define RFID_RESP_NOTAG "RFID:NOTAG" /* No tag found response */
 
