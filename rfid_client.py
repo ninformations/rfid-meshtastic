@@ -2,21 +2,23 @@
 """
 RFID Meshtastic Client
 
-Sends SCAN commands to the RFID reader node and listens for responses
-on PRIVATE_APP port (256).
+Session-based RFID reader control over mesh. Sends START/STOP commands
+to the reader node and displays continuous heartbeat stream.
 
 Usage:
-    uv run python rfid_client.py                    # Listen only
-    uv run python rfid_client.py scan               # Send SCAN + listen
-    uv run python rfid_client.py poweron             # Force RFID reader ON
-    uv run python rfid_client.py poweroff            # Force RFID reader OFF
-    uv run python rfid_client.py scan --dest !d9a0f6a2  # Send to specific node
+    uv run python rfid_client.py                     # Listen only
+    uv run python rfid_client.py start               # Start reading session
+    uv run python rfid_client.py stop                 # Stop reading session
+    uv run python rfid_client.py poweron              # Force RFID reader ON (debug)
+    uv run python rfid_client.py poweroff             # Force RFID reader OFF (debug)
+    uv run python rfid_client.py start --dest !d9a0f6a2  # Send to specific node
     uv run python rfid_client.py --port /dev/tty.usbmodem1234  # Specify serial port
 """
 
 import argparse
 import sys
 import time
+from datetime import datetime
 
 import meshtastic
 import meshtastic.serial_interface
@@ -33,17 +35,20 @@ def on_receive(packet, interface):
         from_id = packet.get("fromId", "unknown")
         rssi = packet.get("rxRssi", "?")
         snr = packet.get("rxSnr", "?")
+        ts = datetime.now().strftime("%H:%M:%S")
 
         if payload.startswith("RFID:"):
-            tag = payload[5:]
-            if tag == "NOTAG":
-                print(f"[{from_id}] No tag found (RSSI: {rssi}, SNR: {snr})")
+            data = payload[5:]
+            if data == "NOTAG":
+                print(f"[{ts}] [{from_id}] Session timeout - no tag found (RSSI: {rssi}, SNR: {snr})")
+            elif data == "GONE":
+                print(f"[{ts}] [{from_id}] Tag left range - session ended (RSSI: {rssi}, SNR: {snr})")
             else:
-                print(f"[{from_id}] Tag scanned: {tag} (RSSI: {rssi}, SNR: {snr})")
-        elif payload == "SCAN":
-            print(f"[{from_id}] SCAN request received (RSSI: {rssi}, SNR: {snr})")
+                print(f"[{ts}] [{from_id}] Tag: {data} (RSSI: {rssi}, SNR: {snr})")
+        elif payload in ("START", "STOP"):
+            print(f"[{ts}] [{from_id}] {payload} command (RSSI: {rssi}, SNR: {snr})")
         else:
-            print(f"[{from_id}] Unknown: {payload} (RSSI: {rssi}, SNR: {snr})")
+            print(f"[{ts}] [{from_id}] Unknown: {payload} (RSSI: {rssi}, SNR: {snr})")
 
 
 def on_connection(interface, topic=pub.AUTO_TOPIC):
@@ -53,8 +58,8 @@ def on_connection(interface, topic=pub.AUTO_TOPIC):
 def main():
     parser = argparse.ArgumentParser(description="RFID Meshtastic Client")
     parser.add_argument("command", nargs="?", default="listen",
-                        choices=["scan", "listen", "poweron", "poweroff"],
-                        help="'scan' to send SCAN, 'poweron'/'poweroff' to toggle RFID power, 'listen' to just listen (default)")
+                        choices=["start", "stop", "listen", "poweron", "poweroff"],
+                        help="'start' to begin session, 'stop' to end, 'listen' to just listen (default)")
     parser.add_argument("--dest", default=SENDER_NODE_ID,
                         help=f"Destination node ID (default: {SENDER_NODE_ID})")
     parser.add_argument("--port", default=None,
@@ -71,9 +76,10 @@ def main():
         print(f"Failed to connect: {e}")
         sys.exit(1)
 
-    if args.command in ("scan", "poweron", "poweroff"):
+    if args.command in ("start", "stop", "poweron", "poweroff"):
         cmd = {
-            "scan": "SCAN",
+            "start": "START",
+            "stop": "STOP",
             "poweron": "POWERON",
             "poweroff": "POWEROFF",
         }[args.command]

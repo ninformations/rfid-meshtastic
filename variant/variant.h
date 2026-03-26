@@ -19,8 +19,8 @@
  *   P0.17  D2                   P0.31  BATTERY_PIN (A0)
  *   P0.20  D3                   P0.29  (A1)
  *   P0.22  D4                   P0.02  (A2)
- *   P0.24  D5                   P1.15  (A3)
- *   P1.00  D6  RFID_POWER      P1.13  D15/SCK
+ *   P0.24  D5  RFID_POWER      P1.15  (A3)
+ *   P1.00  D6  (avoid-TRACE)   P1.13  D15/SCK
  *   P0.11  D7  LORA_DIO1       P1.11  D14/MISO
  *   P1.04  D8  LORA_BUSY       P0.10  D16/MOSI
  *   P1.06  D9  LORA_RESET      P0.09  D10  LORA_CS
@@ -135,7 +135,7 @@ static const uint8_t SCK = PIN_SPI_SCK;
  * and the high-side MOSFET power switch.
  * HIGH = RDM6300 powered (5V), LOW = RDM6300 off (default)
  * ────────────────────────────────────────────── */
-#define PIN_RFID_POWER (32 + 0) // P1.00 (gpio 32) at D6 position
+#define PIN_RFID_POWER (0 + 24) // P0.24 (gpio 24) at D5 position (moved from P1.00/D6 — TRACEDATA0 conflict)
 #define RFID_POWER_ON HIGH
 #define RFID_POWER_OFF LOW
 
@@ -149,8 +149,9 @@ static const uint8_t SCK = PIN_SPI_SCK;
 #define PIN_WIRE_SCL (0 + 20) // P0.20 (D3 position) - not physically connected to I2C
 
 /* ──────────────────────────────────────────────
- * No GPS on this board
+ * No GPS on this board - fully disabled
  * ────────────────────────────────────────────── */
+#define HAS_GPS 0
 #undef GPS_RX_PIN
 #undef GPS_TX_PIN
 #define GPS_RX_PIN -1

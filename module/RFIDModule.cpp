@@ -1,9 +1,8 @@
 /*
- * RFIDModule - Meshtastic module for on-demand RDM6300 RFID reading
+ * RFIDModule - Session-based Meshtastic module for RDM6300 RFID reading
  *
- * Both nodes idle by default (RDM6300 powered off). Either peer can
- * trigger a scan on the other via a SCAN command over the mesh, or
- * locally via serial console ("SCAN" + Enter).
+ * Remote START → continuous UART polling → heartbeat every 5s →
+ * auto-stop on tag-gone (10s) or session timeout (30s no tag).
  *
  * Follows the DetectionSensorModule pattern (SinglePortModule + OSThread).
  */
@@ -17,6 +16,7 @@
 
 #include <Arduino.h>
 #include <string.h>
+#include "nrf_gpio.h"
 
 /* Module singleton */
 RFIDModule *rfidModule = nullptr;
@@ -32,7 +32,7 @@ RFIDModule::RFIDModule()
     } else {
         LOG_WARN("RFID: Module initialized, NO PEER CONFIGURED (broadcast mode)");
     }
-    LOG_INFO("RFID: Idle mode - type SCAN in serial or send SCAN from peer to trigger");
+    LOG_INFO("RFID: Idle mode - send START from peer to begin session");
 }
 
 /* ════════════════════════════════════════════════════════════
@@ -42,7 +42,6 @@ RFIDModule::RFIDModule()
 int32_t RFIDModule::runOnce()
 {
 #ifndef PIN_RFID_POWER
-    /* No RFID hardware on this variant - disable module */
     return disable();
 #else
     switch (state) {
@@ -50,10 +49,10 @@ int32_t RFIDModule::runOnce()
         return handleIdle();
     case RFID_POWERING_ON:
         return handlePoweringOn();
-    case RFID_SCANNING:
-        return handleScanning();
-    case RFID_SENDING:
-        return handleSending();
+    case RFID_LISTENING:
+        return handleListening();
+    case RFID_READING:
+        return handleReading();
     case RFID_POWERING_OFF:
         return handlePoweringOff();
     default:
@@ -75,71 +74,148 @@ void RFIDModule::setState(RFIDState newState)
 
 int32_t RFIDModule::handleIdle()
 {
-    /*
-     * Low power idle: RDM6300 is off.
-     * Only check for local serial "SCAN" commands.
-     * Mesh SCAN commands are handled in handleReceived().
-     */
+#ifdef PIN_RFID_POWER
+    /* GPIO diagnostic: check pin state matches output register */
+    NRF_GPIO_Type *port = (PIN_RFID_POWER >= 32) ? NRF_P1 : NRF_P0;
+    uint32_t pin_in_port = PIN_RFID_POWER & 0x1F;
+
+    uint32_t pin_cnf = port->PIN_CNF[pin_in_port];
+    uint32_t out_bit = (port->OUT >> pin_in_port) & 1;
+
+    /* Briefly enable input buffer to read real pad voltage */
+    port->PIN_CNF[pin_in_port] = pin_cnf & ~(1UL << 1);
+    __DSB();
+    __NOP(); __NOP(); __NOP(); __NOP();
+    volatile uint32_t r1 = (port->IN >> pin_in_port) & 1;
+    volatile uint32_t r2 = (port->IN >> pin_in_port) & 1;
+    volatile uint32_t r3 = (port->IN >> pin_in_port) & 1;
+    port->PIN_CNF[pin_in_port] = pin_cnf;
+    uint32_t actual_pin = (r1 + r2 + r3) >= 2 ? 1 : 0;
+
+    if (pin_cnf != lastPinCnf) {
+        LOG_WARN("RFID: GPIO%d config changed: PIN_CNF=0x%08lX (was 0x%08lX)",
+                 PIN_RFID_POWER, (unsigned long)pin_cnf, (unsigned long)lastPinCnf);
+        lastPinCnf = pin_cnf;
+    }
+
+    if (actual_pin != out_bit) {
+        pinMismatchCount++;
+        if (pinMismatchCount <= 5 || (pinMismatchCount % 20) == 0) {
+            LOG_ERROR("RFID: GPIO%d OUTPUT=%d but pin READS %d! (mismatch #%lu)",
+                      PIN_RFID_POWER, out_bit, actual_pin, (unsigned long)pinMismatchCount);
+        }
+    } else if (pinMismatchCount > 0) {
+        LOG_INFO("RFID: GPIO%d now matches (OUT=%d, PIN=%d). Resolved after %lu mismatches.",
+                 PIN_RFID_POWER, out_bit, actual_pin, (unsigned long)pinMismatchCount);
+        pinMismatchCount = 0;
+    }
+
+    nrf_gpio_pin_clear(PIN_RFID_POWER);
+#endif
     checkSerialInput();
     return RFID_IDLE_POLL_MS;
 }
 
 int32_t RFIDModule::handlePoweringOn()
 {
-    /* RDM6300 needs ~200ms after power-on to stabilize */
     initUART();
     flushUART();
     bufferIndex = 0;
-    tagFound = false;
-    lastTagId = 0;
+    currentTagId[0] = '\0';
+    lastTagSeenAt = 0;
+    lastHeartbeatAt = 0;
 
-    LOG_INFO("RFID: Reader powered, scanning for tags...");
-    setState(RFID_SCANNING);
-    return 50; /* Poll UART every 50ms */
+    LOG_INFO("RFID: Reader powered, listening for tags...");
+    setState(RFID_LISTENING);
+    return RFID_UART_POLL_MS;
 }
 
-int32_t RFIDModule::handleScanning()
+int32_t RFIDModule::handleListening()
 {
     uint32_t tagId = 0;
 
     if (readRDM6300(&tagId)) {
-        LOG_INFO("RFID: Tag detected: %08lX", (unsigned long)tagId);
-        lastTagId = tagId;
-        tagFound = true;
-        setState(RFID_SENDING);
-        return 10; /* Send immediately */
+        snprintf(currentTagId, sizeof(currentTagId), "%08lX", (unsigned long)tagId);
+        LOG_INFO("RFID: Tag detected: %s", currentTagId);
+
+        /* Send first heartbeat immediately */
+        sendTagHeartbeat(currentTagId);
+        lastTagSeenAt = millis();
+        lastHeartbeatAt = millis();
+
+        setState(RFID_READING);
+        return RFID_UART_POLL_MS;
     }
 
-    /* Check for scan timeout */
-    if (millis() - stateEnteredAt >= RFID_READ_TIMEOUT_MS) {
-        LOG_DEBUG("RFID: No tag found within %dms timeout", RFID_READ_TIMEOUT_MS);
-        tagFound = false;
-        setState(RFID_SENDING);
-        return 10;
+    /* Check for listen timeout (no tag ever detected) */
+    if (millis() - stateEnteredAt >= RFID_LISTEN_TIMEOUT_MS) {
+        LOG_INFO("RFID: No tag detected within %ds, ending session", RFID_LISTEN_TIMEOUT_MS / 1000);
+        endSession(RFID_RESP_NOTAG);
+        return RFID_POWER_OFF_DELAY_MS;
     }
 
-    return 50; /* Keep polling UART */
+    checkSerialInput();
+    return RFID_UART_POLL_MS;
 }
 
-int32_t RFIDModule::handleSending()
+int32_t RFIDModule::handleReading()
 {
-    if (tagFound) {
-        sendTagResponse(lastTagId);
-    } else {
-        sendNoTagResponse();
+    uint32_t tagId = 0;
+    uint32_t now = millis();
+
+    /* Poll UART for tag data */
+    if (readRDM6300(&tagId)) {
+        char tagHex[9];
+        snprintf(tagHex, sizeof(tagHex), "%08lX", (unsigned long)tagId);
+
+        /* Update tracking regardless of whether it's the same tag */
+        lastTagSeenAt = now;
+
+        /* If tag changed, log it and send immediate heartbeat */
+        if (strcmp(tagHex, currentTagId) != 0) {
+            LOG_INFO("RFID: Tag changed: %s → %s", currentTagId, tagHex);
+            memcpy(currentTagId, tagHex, sizeof(currentTagId));
+            sendTagHeartbeat(currentTagId);
+            lastHeartbeatAt = now;
+        }
     }
 
-    setState(RFID_POWERING_OFF);
-    return RFID_POWER_OFF_DELAY_MS;
+    /* Send periodic heartbeat */
+    if (now - lastHeartbeatAt >= RFID_HEARTBEAT_INTERVAL_MS) {
+        sendTagHeartbeat(currentTagId);
+        lastHeartbeatAt = now;
+    }
+
+    /* Check for tag-gone (no UART reads for 10s) */
+    if (now - lastTagSeenAt >= RFID_TAG_GONE_TIMEOUT_MS) {
+        LOG_INFO("RFID: Tag %s gone (no read for %ds), ending session",
+                 currentTagId, RFID_TAG_GONE_TIMEOUT_MS / 1000);
+        endSession(RFID_RESP_GONE);
+        return RFID_POWER_OFF_DELAY_MS;
+    }
+
+    checkSerialInput();
+    return RFID_UART_POLL_MS;
 }
 
 int32_t RFIDModule::handlePoweringOff()
 {
     powerOffRFID();
+    sessionStartedBy = 0;
+    currentTagId[0] = '\0';
+    lastTagSeenAt = 0;
+    lastHeartbeatAt = 0;
 
     LOG_DEBUG("RFID: Reader powered off, returning to idle");
     setState(RFID_IDLE);
     return RFID_IDLE_POLL_MS;
+}
+
+/* Helper: end session with a final message and transition to power off */
+void RFIDModule::endSession(const char *finalMessage)
+{
+    sendMeshPacket(finalMessage);
+    setState(RFID_POWERING_OFF);
 }
 
 /* ════════════════════════════════════════════════════════════
@@ -149,19 +225,29 @@ int32_t RFIDModule::handlePoweringOff()
 void RFIDModule::powerOnRFID()
 {
 #ifdef PIN_RFID_POWER
-    pinMode(PIN_RFID_POWER, OUTPUT);
-    digitalWrite(PIN_RFID_POWER, RFID_POWER_ON);
-    LOG_DEBUG("RFID: Power ON (GPIO %d HIGH)", PIN_RFID_POWER);
+    nrf_gpio_cfg(PIN_RFID_POWER,
+                 NRF_GPIO_PIN_DIR_OUTPUT,
+                 NRF_GPIO_PIN_INPUT_DISCONNECT,
+                 NRF_GPIO_PIN_NOPULL,
+                 NRF_GPIO_PIN_H0H1,
+                 NRF_GPIO_PIN_NOSENSE);
+    nrf_gpio_pin_set(PIN_RFID_POWER);
+    LOG_DEBUG("RFID: Power ON (GPIO %d HIGH, high-drive)", PIN_RFID_POWER);
 #endif
 }
 
 void RFIDModule::powerOffRFID()
 {
 #ifdef PIN_RFID_POWER
-    digitalWrite(PIN_RFID_POWER, RFID_POWER_OFF);
-    LOG_DEBUG("RFID: Power OFF (GPIO %d LOW)", PIN_RFID_POWER);
+    nrf_gpio_cfg(PIN_RFID_POWER,
+                 NRF_GPIO_PIN_DIR_OUTPUT,
+                 NRF_GPIO_PIN_INPUT_DISCONNECT,
+                 NRF_GPIO_PIN_NOPULL,
+                 NRF_GPIO_PIN_H0H1,
+                 NRF_GPIO_PIN_NOSENSE);
+    nrf_gpio_pin_clear(PIN_RFID_POWER);
+    LOG_DEBUG("RFID: Power OFF (GPIO %d LOW, high-drive)", PIN_RFID_POWER);
 
-    /* End Serial2 to release UART pins and save power */
     if (uartInitialized) {
         Serial2.end();
         uartInitialized = false;
@@ -191,9 +277,6 @@ void RFIDModule::flushUART()
 
 /* ════════════════════════════════════════════════════════════
  * Local serial command input
- *
- * Type "SCAN" + Enter in serial monitor to send a scan request
- * to the paired peer node.
  * ════════════════════════════════════════════════════════════ */
 
 void RFIDModule::checkSerialInput()
@@ -201,53 +284,96 @@ void RFIDModule::checkSerialInput()
     while (Serial.available()) {
         char c = Serial.read();
 
-        /* Newline terminates command */
         if (c == '\n' || c == '\r') {
             if (serialCmdLen > 0) {
                 serialCmdBuf[serialCmdLen] = '\0';
 
-                if (strcasecmp(serialCmdBuf, RFID_CMD_SCAN) == 0) {
-                    LOG_INFO("RFID: Local SCAN command - requesting peer to scan");
-                    sendScanRequest();
-                } else if (strcasecmp(serialCmdBuf, RFID_CMD_LOCAL) == 0) {
-                    LOG_INFO("RFID: Local test - powering on RFID reader...");
-                    powerOnRFID();
-                    setState(RFID_POWERING_ON);
-                    setIntervalFromNow(RFID_POWER_ON_DELAY_MS);
+                if (strcasecmp(serialCmdBuf, RFID_CMD_START) == 0) {
+                    if (state != RFID_IDLE) {
+                        LOG_WARN("RFID: Already in session (state=%d)", state);
+                    } else {
+                        LOG_INFO("RFID: Local START - beginning session");
+                        sessionStartedBy = 0; /* Local session, broadcast responses */
+                        powerOnRFID();
+                        setState(RFID_POWERING_ON);
+                        setIntervalFromNow(RFID_POWER_ON_DELAY_MS);
+                    }
+                } else if (strcasecmp(serialCmdBuf, RFID_CMD_STOP) == 0) {
+                    if (state == RFID_IDLE) {
+                        LOG_WARN("RFID: No active session to stop");
+                    } else {
+                        LOG_INFO("RFID: Local STOP - ending session");
+                        setState(RFID_POWERING_OFF);
+                        setIntervalFromNow(0);
+                    }
                 } else if (strcasecmp(serialCmdBuf, RFID_CMD_PWRON) == 0) {
                     LOG_INFO("RFID: DEBUG - Forcing power ON (GPIO %d HIGH)", PIN_RFID_POWER);
-                    pinMode(PIN_RFID_POWER, OUTPUT);
-                    digitalWrite(PIN_RFID_POWER, HIGH);
+                    powerOnRFID();
                 } else if (strcasecmp(serialCmdBuf, RFID_CMD_PWROFF) == 0) {
                     LOG_INFO("RFID: DEBUG - Forcing power OFF (GPIO %d LOW)", PIN_RFID_POWER);
-                    pinMode(PIN_RFID_POWER, OUTPUT);
-                    digitalWrite(PIN_RFID_POWER, LOW);
+                    powerOffRFID();
+                } else if (strcasecmp(serialCmdBuf, RFID_CMD_STATUS) == 0) {
+                    printGPIOStatus();
                 } else {
-                    LOG_WARN("RFID: Unknown command (use SCAN, LOCALSCAN, POWERON, POWEROFF)");
+                    LOG_WARN("RFID: Unknown command (use START, STOP, POWERON, POWEROFF, STATUS)");
                 }
                 serialCmdLen = 0;
             }
             continue;
         }
 
-        /* Accumulate characters */
         if (serialCmdLen < SERIAL_CMD_BUF_SIZE - 1) {
             serialCmdBuf[serialCmdLen++] = c;
         }
     }
 }
 
+void RFIDModule::printGPIOStatus()
+{
+#ifdef PIN_RFID_POWER
+    NRF_GPIO_Type *port = (PIN_RFID_POWER >= 32) ? NRF_P1 : NRF_P0;
+    uint32_t pin_in_port = PIN_RFID_POWER & 0x1F;
+
+    uint32_t pin_cnf = port->PIN_CNF[pin_in_port];
+    uint32_t out_bit = (port->OUT >> pin_in_port) & 1;
+
+    port->PIN_CNF[pin_in_port] = pin_cnf & ~(1UL << 1);
+    __DSB();
+    __NOP(); __NOP(); __NOP(); __NOP();
+    uint32_t actual_pin = (port->IN >> pin_in_port) & 1;
+    port->PIN_CNF[pin_in_port] = pin_cnf;
+
+    uint32_t dir = pin_cnf & 1;
+    uint32_t drive = (pin_cnf >> 8) & 7;
+    uint32_t pull = (pin_cnf >> 2) & 3;
+    const char *port_name = (PIN_RFID_POWER >= 32) ? "P1" : "P0";
+
+    LOG_INFO("RFID: === GPIO %d (%s.%02d) STATUS ===", PIN_RFID_POWER, port_name, pin_in_port);
+    LOG_INFO("RFID:   PIN_CNF=0x%08lX DIR=%s DRIVE=%s PULL=%s",
+             (unsigned long)pin_cnf,
+             dir ? "OUT" : "IN",
+             drive == 0 ? "S0S1" : drive == 3 ? "H0H1" : "OTHER",
+             pull == 0 ? "NONE" : pull == 1 ? "DOWN" : "UP");
+    LOG_INFO("RFID:   OUT=%d  Actual PIN=%d  %s",
+             out_bit, actual_pin,
+             (actual_pin != out_bit) ? "<-- MISMATCH!" : "(OK)");
+    LOG_INFO("RFID:   State=%d, session_by=0x%08lX, tag=%s",
+             state, (unsigned long)sessionStartedBy,
+             currentTagId[0] ? currentTagId : "(none)");
+#else
+    LOG_INFO("RFID: PIN_RFID_POWER not defined for this variant");
+#endif
+}
+
 /* ════════════════════════════════════════════════════════════
  * RDM6300 protocol handling
  *
  * Packet format (14 bytes):
- *   Byte 0:     0x02 (STX - start)
+ *   Byte 0:     0x02 (STX)
  *   Byte 1-2:   Version (2 ASCII hex chars)
  *   Byte 3-10:  Tag ID (8 ASCII hex chars = 4 bytes)
  *   Byte 11-12: Checksum (2 ASCII hex chars)
- *   Byte 13:    0x03 (ETX - end)
- *
- * Checksum: XOR of all 5 data bytes (version + tag ID)
+ *   Byte 13:    0x03 (ETX)
  * ════════════════════════════════════════════════════════════ */
 
 bool RFIDModule::readRDM6300(uint32_t *tagId)
@@ -259,24 +385,20 @@ bool RFIDModule::readRDM6300(uint32_t *tagId)
         uint8_t c = Serial2.read();
 
         if (c == RDM6300_START_BYTE) {
-            /* Start of new packet */
             bufferIndex = 0;
             uartBuffer[bufferIndex++] = c;
         } else if (bufferIndex > 0) {
             uartBuffer[bufferIndex++] = c;
 
             if (bufferIndex >= RDM6300_PACKET_SIZE) {
-                /* Full packet received */
                 if (uartBuffer[RDM6300_PACKET_SIZE - 1] == RDM6300_END_BYTE) {
                     bool valid = parseRDM6300Packet(uartBuffer, tagId);
                     bufferIndex = 0;
                     return valid;
                 }
-                /* Bad packet end byte, reset */
                 bufferIndex = 0;
             }
         }
-        /* Ignore bytes outside of a packet (before STX) */
     }
 
     return false;
@@ -284,17 +406,11 @@ bool RFIDModule::readRDM6300(uint32_t *tagId)
 
 bool RFIDModule::parseRDM6300Packet(const uint8_t *packet, uint32_t *tagId)
 {
-    /* Verify framing */
     if (packet[0] != RDM6300_START_BYTE || packet[13] != RDM6300_END_BYTE) {
         LOG_WARN("RFID: Bad packet framing");
         return false;
     }
 
-    /*
-     * Calculate checksum: XOR of 5 data bytes
-     * Data bytes are encoded as 10 ASCII hex characters (bytes 1-10)
-     * Each pair of hex chars forms one byte: [1,2], [3,4], [5,6], [7,8], [9,10]
-     */
     uint8_t checksum = 0;
     for (int i = 0; i < 5; i++) {
         uint8_t high = hexCharToValue(packet[1 + i * 2]);
@@ -306,7 +422,6 @@ bool RFIDModule::parseRDM6300Packet(const uint8_t *packet, uint32_t *tagId)
         checksum ^= (high << 4) | low;
     }
 
-    /* Verify checksum against bytes 11-12 */
     uint8_t rxHigh = hexCharToValue(packet[11]);
     uint8_t rxLow = hexCharToValue(packet[12]);
     if (rxHigh == 0xFF || rxLow == 0xFF) {
@@ -320,10 +435,6 @@ bool RFIDModule::parseRDM6300Packet(const uint8_t *packet, uint32_t *tagId)
         return false;
     }
 
-    /*
-     * Extract 4-byte tag ID from bytes 3-10 (skip 2-char version prefix)
-     * 8 ASCII hex chars = 32-bit tag ID
-     */
     *tagId = 0;
     for (int i = 0; i < 8; i++) {
         uint8_t nibble = hexCharToValue(packet[3 + i]);
@@ -345,7 +456,7 @@ uint8_t RFIDModule::hexCharToValue(uint8_t c)
         return c - 'A' + 10;
     if (c >= 'a' && c <= 'f')
         return c - 'a' + 10;
-    return 0xFF; /* Invalid hex character */
+    return 0xFF;
 }
 
 /* ════════════════════════════════════════════════════════════
@@ -360,40 +471,35 @@ void RFIDModule::sendMeshPacket(const char *payload)
         return;
     }
 
-    /* Set packet destination */
-    if (RFID_PEER_NODE_ID != 0) {
+    /* Set destination: session requester, configured peer, or broadcast */
+    if (sessionStartedBy != 0) {
+        p->to = sessionStartedBy;
+    } else if (RFID_PEER_NODE_ID != 0) {
         p->to = RFID_PEER_NODE_ID;
     } else {
         p->to = NODENUM_BROADCAST;
     }
 
-    /* Copy payload */
     p->decoded.payload.size = strlen(payload);
     memcpy(p->decoded.payload.bytes, payload, p->decoded.payload.size);
 
     p->want_ack = true;
     p->hop_limit = 1;
 
-    LOG_INFO("RFID: TX to %08lX: %s",
-             (unsigned long)p->to, payload);
-
+    LOG_INFO("RFID: TX to %08lX: %s", (unsigned long)p->to, payload);
     service->sendToMesh(p);
 }
 
-void RFIDModule::sendScanRequest()
-{
-    if (RFID_PEER_NODE_ID == 0) {
-        LOG_WARN("RFID: Cannot send SCAN - no peer configured");
-        return;
-    }
-    sendMeshPacket(RFID_CMD_SCAN);
-}
-
-void RFIDModule::sendTagResponse(uint32_t tagId)
+void RFIDModule::sendTagHeartbeat(const char *tagHex)
 {
     char payload[16];
-    snprintf(payload, sizeof(payload), "%s%08lX", RFID_RESP_PREFIX, (unsigned long)tagId);
+    snprintf(payload, sizeof(payload), "%s%s", RFID_RESP_PREFIX, tagHex);
     sendMeshPacket(payload);
+}
+
+void RFIDModule::sendTagGone()
+{
+    sendMeshPacket(RFID_RESP_GONE);
 }
 
 void RFIDModule::sendNoTagResponse()
@@ -402,12 +508,11 @@ void RFIDModule::sendNoTagResponse()
 }
 
 /* ════════════════════════════════════════════════════════════
- * Receive handler - dispatches SCAN commands and tag responses
+ * Receive handler - dispatches START/STOP and tag responses
  * ════════════════════════════════════════════════════════════ */
 
 ProcessMessage RFIDModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
-    /* If a peer is configured, only accept messages from that peer */
     if (RFID_PEER_NODE_ID != 0 && mp.from != RFID_PEER_NODE_ID) {
         LOG_DEBUG("RFID: Ignoring message from unknown node %08X (peer=%08lX)",
                   mp.from, (unsigned long)RFID_PEER_NODE_ID);
@@ -418,7 +523,6 @@ ProcessMessage RFIDModule::handleReceived(const meshtastic_MeshPacket &mp)
     if (p.payload.size == 0)
         return ProcessMessage::CONTINUE;
 
-    /* Extract payload as string */
     char msg[p.payload.size + 1];
     memcpy(msg, p.payload.bytes, p.payload.size);
     msg[p.payload.size] = '\0';
@@ -426,53 +530,62 @@ ProcessMessage RFIDModule::handleReceived(const meshtastic_MeshPacket &mp)
     LOG_INFO("RFID: RX from %08X: %s (RSSI: %d, SNR: %.1f)",
              mp.from, msg, mp.rx_rssi, mp.rx_snr);
 
-    /* ── Handle SCAN command from peer ── */
-    if (strcmp(msg, RFID_CMD_SCAN) == 0) {
+    /* ── Handle START command ── */
+    if (strcmp(msg, RFID_CMD_START) == 0) {
         if (state != RFID_IDLE) {
-            LOG_WARN("RFID: Scan requested but already busy (state=%d)", state);
+            LOG_WARN("RFID: Session already active (state=%d), ignoring START", state);
             return ProcessMessage::CONTINUE;
         }
 
-        LOG_INFO("RFID: Scan requested by peer %08X, powering on reader...", mp.from);
+        LOG_INFO("RFID: Session started by peer %08X", mp.from);
+        sessionStartedBy = mp.from;
         powerOnRFID();
         setState(RFID_POWERING_ON);
-        /* Wake the OSThread immediately to process the power-on */
         setIntervalFromNow(RFID_POWER_ON_DELAY_MS);
         return ProcessMessage::CONTINUE;
     }
 
-    /* ── Handle POWERON/POWEROFF debug commands from peer ── */
+    /* ── Handle STOP command ── */
+    if (strcmp(msg, RFID_CMD_STOP) == 0) {
+        if (state == RFID_IDLE) {
+            LOG_WARN("RFID: No active session to stop");
+        } else {
+            LOG_INFO("RFID: Session stopped by peer %08X", mp.from);
+            setState(RFID_POWERING_OFF);
+            setIntervalFromNow(0);
+        }
+        return ProcessMessage::CONTINUE;
+    }
+
+    /* ── Handle POWERON/POWEROFF debug commands ── */
     if (strcmp(msg, RFID_CMD_PWRON) == 0) {
         LOG_INFO("RFID: Remote POWERON from %08X - forcing GPIO HIGH", mp.from);
-        pinMode(PIN_RFID_POWER, OUTPUT);
-        digitalWrite(PIN_RFID_POWER, HIGH);
+        powerOnRFID();
         return ProcessMessage::CONTINUE;
     }
     if (strcmp(msg, RFID_CMD_PWROFF) == 0) {
         LOG_INFO("RFID: Remote POWEROFF from %08X - forcing GPIO LOW", mp.from);
-        pinMode(PIN_RFID_POWER, OUTPUT);
-        digitalWrite(PIN_RFID_POWER, LOW);
+        powerOffRFID();
+        setState(RFID_IDLE);
         return ProcessMessage::CONTINUE;
     }
 
-    /* ── Handle RFID tag response from peer ── */
+    /* ── Handle RFID responses (on receiver side) ── */
     if (strncmp(msg, RFID_RESP_PREFIX, strlen(RFID_RESP_PREFIX)) == 0) {
         const char *data = msg + strlen(RFID_RESP_PREFIX);
 
         if (strcmp(data, "NOTAG") == 0) {
-            LOG_INFO("RFID: Peer reports no tag found");
+            LOG_INFO("RFID: Peer reports no tag found (session timeout)");
+        } else if (strcmp(data, "GONE") == 0) {
+            LOG_INFO("RFID: Peer reports tag left range");
         } else {
-            LOG_INFO("RFID: Peer scanned tag: %s", data);
+            LOG_INFO("RFID: Peer tag heartbeat: %s", data);
         }
 
-        /* Flash LED to indicate response received */
 #ifdef LED_BUILTIN
-        for (int i = 0; i < 3; i++) {
-            digitalWrite(LED_BUILTIN, LED_STATE_ON);
-            delay(100);
-            digitalWrite(LED_BUILTIN, !LED_STATE_ON);
-            delay(100);
-        }
+        digitalWrite(LED_BUILTIN, LED_STATE_ON);
+        delay(50);
+        digitalWrite(LED_BUILTIN, !LED_STATE_ON);
 #endif
         return ProcessMessage::CONTINUE;
     }

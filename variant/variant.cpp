@@ -37,9 +37,10 @@ void initVariant()
     digitalWrite(PIN_3V3_EN, HIGH);
 
     /*
-     * Set RFID power OFF by default (P1.00)
+     * Set RFID power OFF by default (P0.24 / D5)
      * The RDM6300 is only powered during active scan cycles to save ~1.5mA.
      * GPIO controls both the MT3608 boost converter EN and the MOSFET switch.
+     * Note: Previously P1.00/D6 but TRACEDATA0 conflict made it unreliable.
      */
     pinMode(PIN_RFID_POWER, OUTPUT);
     digitalWrite(PIN_RFID_POWER, RFID_POWER_OFF);
