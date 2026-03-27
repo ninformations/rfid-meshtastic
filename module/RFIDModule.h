@@ -16,6 +16,7 @@
  *   "RFID:<8-hex-id>" - Heartbeat: tag is in range (sent every 5s)
  *   "RFID:GONE"       - Tag left range, session auto-ending
  *   "RFID:NOTAG"      - Session timeout, no tag ever detected
+ *   "RFID:MISS<n>/<max>" - Pulse scan miss (no tag this cycle)
  *
  * Debug commands (serial + remote):
  *   "POWERON"  / "POWEROFF" - Direct GPIO control
@@ -67,26 +68,27 @@
 #define RFID_RESP_PREFIX "RFID:"     /* Tag data response prefix */
 #define RFID_RESP_NOTAG "RFID:NOTAG" /* No tag found (session timeout) */
 #define RFID_RESP_GONE "RFID:GONE"   /* Tag left range */
+#define RFID_RESP_MISS "RFID:MISS"   /* Pulse scan miss (no tag this cycle) */
 
 /* Timing configuration (milliseconds) */
-#define RFID_POWER_ON_DELAY_MS 200       /* Wait for RDM6300 to boot */
-#define RFID_HEARTBEAT_INTERVAL_MS 5000  /* Send tag presence every 5s */
-#define RFID_TAG_GONE_TIMEOUT_MS 10000   /* No tag for 10s → gone */
-#define RFID_LISTEN_TIMEOUT_MS 30000     /* No tag ever → timeout session */
-#define RFID_UART_POLL_MS 50             /* UART check interval */
+#define RFID_PULSE_BOOT_MS 200           /* Wait for RDM6300 carrier to start */
+#define RFID_PULSE_SCAN_MS 400           /* UART poll window per pulse */
+#define RFID_PULSE_SLEEP_MS 3000         /* Sleep between pulses (reader OFF) */
+#define RFID_MISS_MAX 5                  /* Consecutive missed pulses → tag gone */
+#define RFID_SESSION_TIMEOUT_MS 30000    /* No tag ever → end session */
+#define RFID_UART_POLL_MS 50             /* UART check interval during scan */
 #define RFID_IDLE_POLL_MS 500            /* Serial check while idle */
-#define RFID_POWER_OFF_DELAY_MS 100      /* Brief delay before idle */
 
 /* Serial input buffer for local commands */
 #define SERIAL_CMD_BUF_SIZE 32
 
 /* Module states */
 enum RFIDState {
-    RFID_IDLE,         /* Reader OFF, waiting for START */
-    RFID_POWERING_ON,  /* GPIO HIGH, waiting for RDM6300 boot */
-    RFID_LISTENING,    /* Reader ON, polling UART for first tag (30s timeout) */
-    RFID_READING,      /* Tag in range, heartbeat every 5s, detect tag-gone */
-    RFID_POWERING_OFF  /* Shutting down RDM6300 */
+    RFID_IDLE,          /* Reader OFF, waiting for START */
+    RFID_PULSE_BOOT,    /* GPIO HIGH, waiting 200ms for RDM6300 carrier */
+    RFID_PULSE_SCAN,    /* Polling UART for tag (max 400ms) */
+    RFID_PULSE_SLEEP,   /* GPIO LOW, sleeping between pulses */
+    RFID_POWERING_OFF   /* Shutting down, end session */
 };
 
 class RFIDModule : public SinglePortModule, private concurrency::OSThread
@@ -106,8 +108,9 @@ class RFIDModule : public SinglePortModule, private concurrency::OSThread
 
     /* Session tracking */
     uint32_t sessionStartedBy = 0;   /* NodeNum of remote requester */
-    uint32_t lastTagSeenAt = 0;      /* millis() of last UART tag read */
-    uint32_t lastHeartbeatAt = 0;    /* millis() of last heartbeat sent */
+    uint32_t sessionStartedAt = 0;   /* millis() when session began */
+    uint32_t consecutiveMisses = 0;  /* Pulses in a row with no tag */
+    bool tagEverSeen = false;        /* Ever detected a tag this session */
     char currentTagId[9] = {0};      /* 8 hex chars + null */
 
     /* GPIO diagnostic */
@@ -135,7 +138,7 @@ class RFIDModule : public SinglePortModule, private concurrency::OSThread
     uint8_t hexCharToValue(uint8_t c);
 
     /* ── Mesh communication ── */
-    void sendMeshPacket(const char *payload);
+    void sendMeshPacket(const char *payload, bool wantAck = true);
     void sendTagHeartbeat(const char *tagHex);
     void sendTagGone();
     void sendNoTagResponse();
@@ -146,9 +149,9 @@ class RFIDModule : public SinglePortModule, private concurrency::OSThread
 
     /* ── State handlers ── */
     int32_t handleIdle();
-    int32_t handlePoweringOn();
-    int32_t handleListening();
-    int32_t handleReading();
+    int32_t handlePulseBoot();
+    int32_t handlePulseScan();
+    int32_t handlePulseSleep();
     int32_t handlePoweringOff();
 
     /* Transition to a new state */

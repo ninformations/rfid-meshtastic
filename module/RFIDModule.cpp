@@ -47,12 +47,12 @@ int32_t RFIDModule::runOnce()
     switch (state) {
     case RFID_IDLE:
         return handleIdle();
-    case RFID_POWERING_ON:
-        return handlePoweringOn();
-    case RFID_LISTENING:
-        return handleListening();
-    case RFID_READING:
-        return handleReading();
+    case RFID_PULSE_BOOT:
+        return handlePulseBoot();
+    case RFID_PULSE_SCAN:
+        return handlePulseScan();
+    case RFID_PULSE_SLEEP:
+        return handlePulseSleep();
     case RFID_POWERING_OFF:
         return handlePoweringOff();
     default:
@@ -116,97 +116,97 @@ int32_t RFIDModule::handleIdle()
     return RFID_IDLE_POLL_MS;
 }
 
-int32_t RFIDModule::handlePoweringOn()
+int32_t RFIDModule::handlePulseBoot()
 {
+    /* RDM6300 has had RFID_PULSE_BOOT_MS to power up — init/flush UART */
     initUART();
     flushUART();
     bufferIndex = 0;
-    currentTagId[0] = '\0';
-    lastTagSeenAt = 0;
-    lastHeartbeatAt = 0;
 
-    LOG_INFO("RFID: Reader powered, listening for tags...");
-    setState(RFID_LISTENING);
+    setState(RFID_PULSE_SCAN);
     return RFID_UART_POLL_MS;
 }
 
-int32_t RFIDModule::handleListening()
+int32_t RFIDModule::handlePulseScan()
 {
     uint32_t tagId = 0;
 
-    if (readRDM6300(&tagId)) {
-        snprintf(currentTagId, sizeof(currentTagId), "%08lX", (unsigned long)tagId);
-        LOG_INFO("RFID: Tag detected: %s", currentTagId);
-
-        /* Send first heartbeat immediately */
-        sendTagHeartbeat(currentTagId);
-        lastTagSeenAt = millis();
-        lastHeartbeatAt = millis();
-
-        setState(RFID_READING);
-        return RFID_UART_POLL_MS;
-    }
-
-    /* Check for listen timeout (no tag ever detected) */
-    if (millis() - stateEnteredAt >= RFID_LISTEN_TIMEOUT_MS) {
-        LOG_INFO("RFID: No tag detected within %ds, ending session", RFID_LISTEN_TIMEOUT_MS / 1000);
-        endSession(RFID_RESP_NOTAG);
-        return RFID_POWER_OFF_DELAY_MS;
-    }
-
-    checkSerialInput();
-    return RFID_UART_POLL_MS;
-}
-
-int32_t RFIDModule::handleReading()
-{
-    uint32_t tagId = 0;
-    uint32_t now = millis();
-
-    /* Poll UART for tag data */
+    /* Try to read a tag from UART */
     if (readRDM6300(&tagId)) {
         char tagHex[9];
         snprintf(tagHex, sizeof(tagHex), "%08lX", (unsigned long)tagId);
 
-        /* Update tracking regardless of whether it's the same tag */
-        lastTagSeenAt = now;
-
-        /* If tag changed, log it and send immediate heartbeat */
-        if (strcmp(tagHex, currentTagId) != 0) {
-            LOG_INFO("RFID: Tag changed: %s → %s", currentTagId, tagHex);
-            memcpy(currentTagId, tagHex, sizeof(currentTagId));
-            sendTagHeartbeat(currentTagId);
-            lastHeartbeatAt = now;
+        if (currentTagId[0] == '\0') {
+            LOG_INFO("RFID: Tag detected: %s", tagHex);
+        } else if (strcmp(tagHex, currentTagId) != 0) {
+            LOG_INFO("RFID: Tag changed: %s -> %s", currentTagId, tagHex);
         }
-    }
+        memcpy(currentTagId, tagHex, sizeof(currentTagId));
 
-    /* Send periodic heartbeat */
-    if (now - lastHeartbeatAt >= RFID_HEARTBEAT_INTERVAL_MS) {
+        tagEverSeen = true;
+        consecutiveMisses = 0;
         sendTagHeartbeat(currentTagId);
-        lastHeartbeatAt = now;
+
+        /* Tag found — power off reader, sleep until next pulse */
+        nrf_gpio_pin_clear(PIN_RFID_POWER);
+        LOG_DEBUG("RFID: Pulse hit, sleeping %ds", RFID_PULSE_SLEEP_MS / 1000);
+        setState(RFID_PULSE_SLEEP);
+        return RFID_PULSE_SLEEP_MS;
     }
 
-    /* Check for tag-gone (no UART reads for 10s) */
-    if (now - lastTagSeenAt >= RFID_TAG_GONE_TIMEOUT_MS) {
-        LOG_INFO("RFID: Tag %s gone (no read for %ds), ending session",
-                 currentTagId, RFID_TAG_GONE_TIMEOUT_MS / 1000);
-        endSession(RFID_RESP_GONE);
-        return RFID_POWER_OFF_DELAY_MS;
+    /* Scan window expired? */
+    if (millis() - stateEnteredAt >= RFID_PULSE_SCAN_MS) {
+        consecutiveMisses++;
+
+        /* Power off reader for sleep */
+        nrf_gpio_pin_clear(PIN_RFID_POWER);
+
+        /* Tag was seen before but now missed too many pulses */
+        if (tagEverSeen && consecutiveMisses >= RFID_MISS_MAX) {
+            LOG_INFO("RFID: Tag %s gone (%d missed pulses)", currentTagId, RFID_MISS_MAX);
+            endSession(RFID_RESP_GONE);
+            return 0;
+        }
+
+        /* Never saw a tag and session timed out */
+        if (!tagEverSeen && (millis() - sessionStartedAt >= RFID_SESSION_TIMEOUT_MS)) {
+            LOG_INFO("RFID: No tag detected within %ds", RFID_SESSION_TIMEOUT_MS / 1000);
+            endSession(RFID_RESP_NOTAG);
+            return 0;
+        }
+
+        /* Send miss notification (fire-and-forget) */
+        char missPayload[20];
+        snprintf(missPayload, sizeof(missPayload), "%s%lu/%d",
+                 RFID_RESP_MISS, (unsigned long)consecutiveMisses, RFID_MISS_MAX);
+        sendMeshPacket(missPayload, false);
+
+        LOG_DEBUG("RFID: Pulse miss #%lu", (unsigned long)consecutiveMisses);
+        setState(RFID_PULSE_SLEEP);
+        return RFID_PULSE_SLEEP_MS;
     }
 
-    checkSerialInput();
     return RFID_UART_POLL_MS;
+}
+
+int32_t RFIDModule::handlePulseSleep()
+{
+    /* Sleep period over — power on for next pulse */
+    nrf_gpio_pin_set(PIN_RFID_POWER);
+    setState(RFID_PULSE_BOOT);
+    return RFID_PULSE_BOOT_MS;
 }
 
 int32_t RFIDModule::handlePoweringOff()
 {
     powerOffRFID();
     sessionStartedBy = 0;
+    sessionStartedAt = 0;
+    consecutiveMisses = 0;
+    tagEverSeen = false;
     currentTagId[0] = '\0';
-    lastTagSeenAt = 0;
-    lastHeartbeatAt = 0;
 
-    LOG_DEBUG("RFID: Reader powered off, returning to idle");
+    LOG_DEBUG("RFID: Session ended, returning to idle");
     setState(RFID_IDLE);
     return RFID_IDLE_POLL_MS;
 }
@@ -292,11 +292,15 @@ void RFIDModule::checkSerialInput()
                     if (state != RFID_IDLE) {
                         LOG_WARN("RFID: Already in session (state=%d)", state);
                     } else {
-                        LOG_INFO("RFID: Local START - beginning session");
-                        sessionStartedBy = 0; /* Local session, broadcast responses */
+                        LOG_INFO("RFID: Local START - beginning pulse-scan session");
+                        sessionStartedBy = 0;
+                        sessionStartedAt = millis();
+                        consecutiveMisses = 0;
+                        tagEverSeen = false;
+                        currentTagId[0] = '\0';
                         powerOnRFID();
-                        setState(RFID_POWERING_ON);
-                        setIntervalFromNow(RFID_POWER_ON_DELAY_MS);
+                        setState(RFID_PULSE_BOOT);
+                        setIntervalFromNow(RFID_PULSE_BOOT_MS);
                     }
                 } else if (strcasecmp(serialCmdBuf, RFID_CMD_STOP) == 0) {
                     if (state == RFID_IDLE) {
@@ -463,7 +467,7 @@ uint8_t RFIDModule::hexCharToValue(uint8_t c)
  * Mesh communication
  * ════════════════════════════════════════════════════════════ */
 
-void RFIDModule::sendMeshPacket(const char *payload)
+void RFIDModule::sendMeshPacket(const char *payload, bool wantAck)
 {
     meshtastic_MeshPacket *p = allocDataPacket();
     if (!p) {
@@ -483,7 +487,7 @@ void RFIDModule::sendMeshPacket(const char *payload)
     p->decoded.payload.size = strlen(payload);
     memcpy(p->decoded.payload.bytes, payload, p->decoded.payload.size);
 
-    p->want_ack = true;
+    p->want_ack = wantAck;
     p->hop_limit = 1;
 
     LOG_INFO("RFID: TX to %08lX: %s", (unsigned long)p->to, payload);
@@ -494,7 +498,7 @@ void RFIDModule::sendTagHeartbeat(const char *tagHex)
 {
     char payload[16];
     snprintf(payload, sizeof(payload), "%s%s", RFID_RESP_PREFIX, tagHex);
-    sendMeshPacket(payload);
+    sendMeshPacket(payload, false); /* No ACK — periodic, next pulse catches loss */
 }
 
 void RFIDModule::sendTagGone()
@@ -539,9 +543,13 @@ ProcessMessage RFIDModule::handleReceived(const meshtastic_MeshPacket &mp)
 
         LOG_INFO("RFID: Session started by peer %08X", mp.from);
         sessionStartedBy = mp.from;
+        sessionStartedAt = millis();
+        consecutiveMisses = 0;
+        tagEverSeen = false;
+        currentTagId[0] = '\0';
         powerOnRFID();
-        setState(RFID_POWERING_ON);
-        setIntervalFromNow(RFID_POWER_ON_DELAY_MS);
+        setState(RFID_PULSE_BOOT);
+        setIntervalFromNow(RFID_PULSE_BOOT_MS);
         return ProcessMessage::CONTINUE;
     }
 
@@ -578,6 +586,8 @@ ProcessMessage RFIDModule::handleReceived(const meshtastic_MeshPacket &mp)
             LOG_INFO("RFID: Peer reports no tag found (session timeout)");
         } else if (strcmp(data, "GONE") == 0) {
             LOG_INFO("RFID: Peer reports tag left range");
+        } else if (strncmp(data, "MISS", 4) == 0) {
+            LOG_INFO("RFID: Peer pulse miss: %s", data + 4);
         } else {
             LOG_INFO("RFID: Peer tag heartbeat: %s", data);
         }
